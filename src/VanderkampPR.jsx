@@ -283,6 +283,15 @@ const styles = `
   /* Empty state */
   .empty { text-align:center; padding:48px 24px; font-size:11px; color:var(--text-dim); font-style:italic; }
 
+  /* Error card */
+  .error-card { margin:18px 0 24px; padding:18px 20px; border:1px solid rgba(224,112,112,0.4); background:rgba(224,112,112,0.06); border-radius:3px; }
+  .error-card .err-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .error-card .err-mark { font-size:9px; letter-spacing:0.18em; text-transform:uppercase; color:var(--red); padding:2px 8px; border:1px solid rgba(224,112,112,0.4); border-radius:3px; }
+  .error-card .err-title { font-size:13px; color:var(--cream); font-weight:500; }
+  .error-card .err-body { font-size:11px; color:var(--text-mid); line-height:1.6; margin-bottom:10px; white-space:pre-wrap; word-break:break-word; }
+  .error-card .err-raw { margin-top:10px; padding:10px 12px; background:rgba(26,46,31,0.7); border:1px solid var(--border); border-radius:3px; font-size:10px; color:var(--text-mid); line-height:1.5; max-height:240px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; }
+  .error-card .err-actions { display:flex; gap:10px; margin-top:12px; }
+
   /* Brand context preview */
   .brand-preview { padding:16px 18px; border:1px solid var(--border); border-radius:3px; margin-bottom:14px; background:rgba(244,239,230,0.015); }
   .brand-label { font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--amber); margin-bottom:8px; }
@@ -767,11 +776,27 @@ const callClaude = async (system, user, webSearch = false) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  const text = await res.text();
   if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Claude API error (${res.status}): ${errText}`);
+    // Try to extract a useful error message from whatever came back
+    let detail = text;
+    try {
+      const parsed = JSON.parse(text);
+      detail = parsed.error?.message || parsed.error || parsed.message || text;
+      if (typeof detail === "object") detail = JSON.stringify(detail);
+    } catch {}
+    throw new Error(`HTTP ${res.status}: ${detail.slice(0, 500)}`);
   }
-  const data = await res.json();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Proxy returned non-JSON response: ${text.slice(0, 200)}`);
+  }
+  if (data.error) {
+    const msg = data.error?.message || data.error;
+    throw new Error(`Anthropic API error: ${typeof msg === "string" ? msg : JSON.stringify(msg)}`);
+  }
   return data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
 };
 
@@ -816,6 +841,7 @@ export default function VanderkampPR() {
   const [activeTab, setActiveTab] = useState("dashboard");
   const [phase, setPhase] = useState("idle");
   const [log, setLog] = useState([]);
+  const [errorState, setErrorState] = useState(null); // { title, body, raw } | null
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
   const [opportunities, setOpportunities] = useState([]);
@@ -911,6 +937,7 @@ export default function VanderkampPR() {
     setDrafts({});
     setDraftMeta({});
     setSeoBriefs({});
+    setErrorState(null);
 
     const categoriesInScope = trackFilter === "all"
       ? CATEGORIES
@@ -933,18 +960,31 @@ export default function VanderkampPR() {
         true
       );
     } catch (err) {
-      addLog("ERROR", `Research failed: ${err.message}`);
+      console.error("[VK] Research API call failed:", err);
+      addLog("ERROR", `API call failed: ${err.message}`);
+      setErrorState({
+        title: "Research API call failed",
+        body: err.message || String(err),
+        raw: null,
+      });
       setPhase("idle");
       return;
     }
 
     setProgress(75);
     setProgressLabel("Parsing results...");
-    addLog("RESEARCH", "Analyzing findings and structuring opportunities...");
+    addLog("RESEARCH", `Got ${raw.length} chars from Claude. Parsing...`);
+    console.log("[VK] Raw research response (first 1000 chars):", raw.slice(0, 1000));
 
     const parsed = parseJsonSafe(raw);
     if (!parsed?.opportunities?.length) {
-      addLog("ERROR", "Could not parse research output — try again");
+      console.error("[VK] Failed to parse research output. Raw response:", raw);
+      addLog("ERROR", "Could not parse research output as JSON.");
+      setErrorState({
+        title: "Could not parse research output",
+        body: "Claude responded but the output wasn't structured opportunities. The full raw response is below — share it with whoever maintains this tool.",
+        raw,
+      });
       setPhase("idle");
       return;
     }
@@ -1440,6 +1480,39 @@ export default function VanderkampPR() {
               ════════════════════════════════════════════════════════════ */}
           {activeTab === "research" && (
             <>
+              {/* ERROR (persistent until dismissed) */}
+              {errorState && phase === "idle" && (
+                <div className="error-card">
+                  <div className="err-head">
+                    <span className="err-mark">Last cycle failed</span>
+                    <span className="err-title">{errorState.title}</span>
+                  </div>
+                  <div className="err-body">{errorState.body}</div>
+                  {errorState.raw && (
+                    <>
+                      <div style={{fontSize:"9px", letterSpacing:"0.14em", textTransform:"uppercase", color:"var(--text-dim)", marginTop:"10px"}}>Raw response</div>
+                      <div className="err-raw">{errorState.raw}</div>
+                    </>
+                  )}
+                  <div className="err-actions">
+                    <button className="btn-ghost" onClick={() => setErrorState(null)}>Dismiss</button>
+                  </div>
+                </div>
+              )}
+
+              {/* LOG (visible when an error occurred so you can see what happened) */}
+              {errorState && phase === "idle" && log.length > 0 && (
+                <div className="log-panel">
+                  {log.map((entry, i) => (
+                    <div key={i} className="log-entry">
+                      <span className="ts">{entry.ts}</span>
+                      <span className="ag">{entry.agent}</span>
+                      {entry.msg}
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {/* IDLE */}
               {phase === "idle" && (
                 <div className="hero-card">
