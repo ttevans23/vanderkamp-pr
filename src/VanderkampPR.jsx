@@ -763,7 +763,10 @@ Keep it under 200 words total. Pull keywords from Vanderkamp's target list where
    HELPERS
    ════════════════════════════════════════════════════════════════════════ */
 
-const callClaude = async (system, user, webSearch = false) => {
+// Reads the streaming SSE response from /api/claude.
+// `onProgress(chars)` (optional) is called as text accumulates so the UI
+// can show liveness during long cycles.
+const callClaude = async (system, user, webSearch = false, onProgress = null) => {
   const body = {
     model: "claude-sonnet-4-20250514",
     max_tokens: 4000,
@@ -771,33 +774,79 @@ const callClaude = async (system, user, webSearch = false) => {
     messages: [{ role: "user", content: user }],
   };
   if (webSearch) body.tools = [{ type: "web_search_20250305", name: "web_search" }];
+
   const res = await fetch("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const text = await res.text();
+
+  // Non-OK = upstream error came back as plain JSON, not a stream
   if (!res.ok) {
-    // Try to extract a useful error message from whatever came back
+    const text = await res.text();
     let detail = text;
     try {
       const parsed = JSON.parse(text);
       detail = parsed.error?.message || parsed.error || parsed.message || text;
       if (typeof detail === "object") detail = JSON.stringify(detail);
     } catch {}
-    throw new Error(`HTTP ${res.status}: ${detail.slice(0, 500)}`);
+    throw new Error(`HTTP ${res.status}: ${String(detail).slice(0, 500)}`);
   }
-  let data;
+
+  // OK = SSE stream. Parse server-sent events and accumulate text deltas.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let accumulatedText = "";
+  let stopReason = null;
+  let streamErrored = null;
+
   try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`Proxy returned non-JSON response: ${text.slice(0, 200)}`);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE messages are separated by blank lines (\n\n). Each message has
+      // an `event: <type>` line and a `data: <json>` line.
+      let sepIdx;
+      while ((sepIdx = buffer.indexOf("\n\n")) !== -1) {
+        const rawEvent = buffer.slice(0, sepIdx);
+        buffer = buffer.slice(sepIdx + 2);
+        if (!rawEvent.trim()) continue;
+
+        const lines = rawEvent.split("\n");
+        let eventType = null;
+        let dataLine = null;
+        for (const line of lines) {
+          if (line.startsWith("event:")) eventType = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataLine = line.slice(5).trim();
+        }
+        if (!dataLine) continue;
+        let evt;
+        try { evt = JSON.parse(dataLine); } catch { continue; }
+
+        if (eventType === "content_block_delta" && evt.delta?.type === "text_delta") {
+          accumulatedText += evt.delta.text || "";
+          if (onProgress) onProgress(accumulatedText.length);
+        } else if (eventType === "message_delta" && evt.delta?.stop_reason) {
+          stopReason = evt.delta.stop_reason;
+        } else if (eventType === "error") {
+          streamErrored = evt.error?.message || JSON.stringify(evt.error || evt);
+        }
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
   }
-  if (data.error) {
-    const msg = data.error?.message || data.error;
-    throw new Error(`Anthropic API error: ${typeof msg === "string" ? msg : JSON.stringify(msg)}`);
+
+  if (streamErrored) {
+    throw new Error(`Stream error: ${streamErrored}`);
   }
-  return data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+  if (!accumulatedText && stopReason !== "end_turn") {
+    throw new Error(`Stream ended with no text (stop_reason: ${stopReason || "unknown"})`);
+  }
+  return accumulatedText;
 };
 
 const ts = () => new Date().toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", second:"2-digit" });
@@ -957,7 +1006,16 @@ export default function VanderkampPR() {
       raw = await callClaude(
         buildResearchPrompt(trackFilter, categoriesInScope),
         `Today is ${today()}. Current marketing month: ${currentMonth()}. Find current opportunities in the categories above.`,
-        true
+        true,
+        (chars) => {
+          // Animate progress bar as chars accumulate. Cap at 70 here;
+          // the parsing step takes us the rest of the way.
+          const pct = Math.min(70, 22 + Math.floor(chars / 80));
+          setProgress(pct);
+          if (chars > 100 && chars % 500 < 50) {
+            setProgressLabel(`Receiving from Claude... ${chars.toLocaleString()} chars`);
+          }
+        }
       );
     } catch (err) {
       console.error("[VK] Research API call failed:", err);
