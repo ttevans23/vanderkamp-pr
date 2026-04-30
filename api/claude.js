@@ -1,5 +1,7 @@
 // Vercel serverless function: /api/claude
-// Proxies requests to Anthropic's API so the API key never reaches the browser.
+// Streams Claude's response back to the browser using Server-Sent Events
+// so the proxy itself completes immediately (within Vercel's timeout)
+// and the browser receives chunks as they arrive.
 
 export const config = { runtime: "edge" };
 
@@ -29,8 +31,12 @@ export default async function handler(req) {
     });
   }
 
+  // Force streaming on so the upstream response arrives in chunks
+  payload.stream = true;
+
+  let upstream;
   try {
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
+    upstream = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -39,16 +45,32 @@ export default async function handler(req) {
       },
       body: JSON.stringify(payload),
     });
-
-    const text = await r.text();
-    return new Response(text, {
-      status: r.status,
-      headers: { "Content-Type": "application/json" },
-    });
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err?.message || err) }), {
-      status: 502,
+    return new Response(
+      JSON.stringify({ error: `Upstream connection failed: ${err?.message || err}` }),
+      { status: 502, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  if (!upstream.ok) {
+    // Upstream returned a non-streaming error — pass it through as JSON
+    const text = await upstream.text();
+    return new Response(text, {
+      status: upstream.status,
       headers: { "Content-Type": "application/json" },
     });
   }
+
+  // Pipe the SSE stream straight through to the browser. The Edge runtime
+  // releases the function the moment streaming starts, so the 10s timeout
+  // doesn't apply to the duration of the upstream request.
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
 }
