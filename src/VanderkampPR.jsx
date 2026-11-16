@@ -768,7 +768,7 @@ Keep it under 200 words total. Pull keywords from Vanderkamp's target list where
 // can show liveness during long cycles.
 const callClaude = async (system, user, webSearch = false, onProgress = null) => {
   const body = {
-    model: "claude-sonnet-4-20250514",
+    model: "claude-sonnet-5-5",
     max_tokens: 4000,
     system,
     messages: [{ role: "user", content: user }],
