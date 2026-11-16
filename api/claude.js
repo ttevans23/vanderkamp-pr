@@ -34,6 +34,10 @@ export default async function handler(req) {
   // Force streaming on so the upstream response arrives in chunks
   payload.stream = true;
 
+  // Optional override: set ANTHROPIC_MODEL in Vercel env vars to change the
+  // model without a code change (e.g. when a model is retired).
+  if (process.env.ANTHROPIC_MODEL) payload.model = process.env.ANTHROPIC_MODEL;
+
   let upstream;
   try {
     upstream = await fetch("https://api.anthropic.com/v1/messages", {
