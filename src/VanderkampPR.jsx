@@ -766,10 +766,11 @@ Keep it under 200 words total. Pull keywords from Vanderkamp's target list where
 // Reads the streaming SSE response from /api/claude.
 // `onProgress(chars)` (optional) is called as text accumulates so the UI
 // can show liveness during long cycles.
+let lastStopReason = null;
 const callClaude = async (system, user, webSearch = false, onProgress = null) => {
   const body = {
     model: "claude-sonnet-5-5",
-    max_tokens: 4000,
+    max_tokens: 16000,
     system,
     messages: [{ role: "user", content: user }],
   };
@@ -843,6 +844,10 @@ const callClaude = async (system, user, webSearch = false, onProgress = null) =>
   if (streamErrored) {
     throw new Error(`Stream error: ${streamErrored}`);
   }
+  lastStopReason = stopReason;
+  if (stopReason === "max_tokens") {
+    console.warn("[VK] Claude hit the max_tokens limit; output may be truncated.");
+  }
   if (!accumulatedText && stopReason !== "end_turn") {
     throw new Error(`Stream ended with no text (stop_reason: ${stopReason || "unknown"})`);
   }
@@ -856,16 +861,70 @@ const currentMonth = () => {
   return d.toLocaleDateString("en-US", { month:"long", year:"numeric" });
 };
 
-const parseJsonSafe = (text) => {
-  const cleaned = text.replace(/```json|```/g, "").trim();
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start === -1 || end === -1) return null;
-  try {
-    return JSON.parse(cleaned.slice(start, end + 1));
-  } catch {
-    return null;
+// Scan from `start` (an opening brace) to its matching close brace,
+// ignoring braces inside JSON strings. Returns the end index or -1.
+const findMatchingBrace = (text, start) => {
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) return i; }
   }
+  return -1;
+};
+
+// Pull complete {...} objects out of a (possibly truncated) JSON array.
+const salvageArrayObjects = (text, arrayStart) => {
+  const items = [];
+  let i = arrayStart + 1;
+  while (i < text.length) {
+    const open = text.indexOf("{", i);
+    if (open === -1) break;
+    const close = findMatchingBrace(text, open);
+    if (close === -1) break; // truncated object, stop here
+    try { items.push(JSON.parse(text.slice(open, close + 1))); } catch {}
+    i = close + 1;
+  }
+  return items;
+};
+
+const parseJsonSafe = (text) => {
+  if (!text) return null;
+  const cleaned = text.replace(/```json|```/g, "");
+
+  // 1. Prefer the object that contains "opportunities" (Claude may write
+  //    prose, or prose containing braces, before the JSON).
+  const key = cleaned.lastIndexOf('"opportunities"');
+  if (key !== -1) {
+    const start = cleaned.lastIndexOf("{", key);
+    if (start !== -1) {
+      const end = findMatchingBrace(cleaned, start);
+      if (end !== -1) {
+        try { return JSON.parse(cleaned.slice(start, end + 1)); } catch {}
+      }
+      // 2. Truncated output: keep every complete opportunity we can recover.
+      const arr = cleaned.indexOf("[", key);
+      if (arr !== -1) {
+        const items = salvageArrayObjects(cleaned, arr);
+        if (items.length) return { opportunities: items, truncated: true };
+      }
+    }
+  }
+
+  // 3. Fallback: first balanced JSON object anywhere in the text.
+  for (let i = cleaned.indexOf("{"); i !== -1; i = cleaned.indexOf("{", i + 1)) {
+    const end = findMatchingBrace(cleaned, i);
+    if (end === -1) break;
+    try { return JSON.parse(cleaned.slice(i, end + 1)); } catch {}
+  }
+  return null;
 };
 
 const parseDraftWithMeta = (text) => {
@@ -1040,7 +1099,9 @@ export default function VanderkampPR() {
       addLog("ERROR", "Could not parse research output as JSON.");
       setErrorState({
         title: "Could not parse research output",
-        body: "Claude responded but the output wasn't structured opportunities. The full raw response is below — share it with whoever maintains this tool.",
+        body: lastStopReason === "max_tokens"
+          ? "Claude's response was cut off before it finished (hit the length limit). Try a single track instead of All Tracks. The raw response is below."
+          : "Claude responded but the output wasn't structured opportunities. The full raw response is below — share it with whoever maintains this tool.",
         raw,
       });
       setPhase("idle");
@@ -1049,6 +1110,7 @@ export default function VanderkampPR() {
 
     setProgress(100);
     setProgressLabel("Complete");
+    if (parsed.truncated) addLog("WARN", "Response was cut off; showing the opportunities that came through complete.");
     addLog("RESEARCH", `Found ${parsed.opportunities.length} opportunities across ${new Set(parsed.opportunities.map(o => o.category)).size} categories`);
 
     setOpportunities(parsed.opportunities);
